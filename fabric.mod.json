@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "styleforge",
+  "version": "${version}",
+  "name": "StyleForge",
+  "description": "Client-seitiges Styles-Menue (Kristalle, Anker, Tools, Himmel, Ruestung, Cosmetics, Feuer, Inventar). Rein visuell, sendet nichts an Server.",
+  "authors": ["StyleForge"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.styleforge.StyleForgeClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.1",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
