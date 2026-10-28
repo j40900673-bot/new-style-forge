@@ -99,7 +99,8 @@ final class Preview3D {
             upload(s, r);
         }
         if (s.tex != null && s.shown != null && s.shown.key() == key && s.shown.n() == n) {
-            ctx.drawTexture(RenderPipelines.GUI_TEXTURED, s.id, x, y, size, size, 0f, 0f, n, n, n, n);
+            // Reihenfolge: x, y, u, v, Breite, Hoehe, Ausschnitt-Breite/-Hoehe, Textur-Breite/-Hoehe
+            ctx.drawTexture(RenderPipelines.GUI_TEXTURED, s.id, x, y, 0f, 0f, size, size, n, n, n, n);
         }
     }
 

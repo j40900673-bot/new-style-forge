@@ -7,6 +7,7 @@
   "authors": ["StyleForge"],
   "license": "MIT",
   "environment": "client",
+  "mixins": ["styleforge.mixins.json"],
   "entrypoints": {
     "client": ["dev.styleforge.StyleForgeClient"]
   },

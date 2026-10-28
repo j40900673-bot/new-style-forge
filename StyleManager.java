@@ -17,6 +17,7 @@ public final class StyleManager {
     public record Extra(String id, String label, boolean defaultValue) {}
 
     public static final List<Extra> EXTRAS = List.of(
+            new Extra("block_particles", "Block break particles", true),
             new Extra("outline", "Outline effect", false),
             new Extra("glint", "Custom enchant glint", false),
             new Extra("reduced_animations", "Reduced UI animations", false));
@@ -178,6 +179,11 @@ public final class StyleManager {
     public static void setExplosionVolume(int percent) {
         config.explosionVolume = Math.max(0, Math.min(100, Math.round(percent / 10f) * 10));
         ConfigIO.save(config);
+    }
+
+    /** Block-Partikel (beim Abbauen und Zerstoeren) an oder aus; wird live vom Mixin gelesen. */
+    public static boolean isBlockParticles() {
+        return config.extras.getOrDefault("block_particles", true);
     }
 
     public static boolean getExtra(Extra e) {

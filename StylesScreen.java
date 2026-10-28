@@ -377,12 +377,12 @@ public class StylesScreen extends Screen {
         btn(cx + 190, top + 34, 16, 16, "+", () -> changeExplosion(10));
         for (int i = 0; i < StyleManager.EXTRAS.size(); i++) {
             StyleManager.Extra e = StyleManager.EXTRAS.get(i);
-            btn(cx, top + 62 + i * 22, CENTER_W, 18,
+            btn(cx, top + 62 + i * 20, CENTER_W, 16,
                     e.label() + ": " + (StyleManager.getExtra(e) ? "ON" : "OFF"),
                     () -> { StyleManager.toggleExtra(e); clearAndInit(); });
         }
-        btn(cx, top + 194, 106, 16, "Export ZIP", this::doExport);
-        btn(cx + 114, top + 194, 106, 16, "Import ZIP", this::doImport);
+        btn(cx, top + 197, 106, 16, "Export ZIP", this::doExport);
+        btn(cx + 114, top + 197, 106, 16, "Import ZIP", this::doImport);
     }
 
     private void doExport() {
@@ -678,13 +678,13 @@ public class StylesScreen extends Screen {
         if (!notice.isEmpty()) {
             ctx.drawText(textRenderer, textRenderer.trimToWidth(notice, CENTER_W), cx, top + 52, C_GOLD, false);
         }
-        int ny = top + 62 + StyleManager.EXTRAS.size() * 22 + 4;
+        int ny = top + 62 + StyleManager.EXTRAS.size() * 20 + 2;
         ctx.drawText(textRenderer, "Outline, glint and UI animation toggles are saved,", cx, ny, C_MUTED, false);
-        ctx.drawText(textRenderer, "but not applied in game yet.", cx, ny + 10, C_GOLD, false);
+        ctx.drawText(textRenderer, "but not applied in game yet.", cx, ny + 9, C_GOLD, false);
 
-        ctx.drawText(textRenderer, "Share textures with friends", cx, top + 182, C_TEXT, false);
+        ctx.drawText(textRenderer, "Share textures with friends", cx, top + 186, C_TEXT, false);
         if (!shareMsg.isEmpty()) {
-            ctx.drawText(textRenderer, textRenderer.trimToWidth(shareMsg, CENTER_W), cx, top + 214, C_GOLD, false);
+            ctx.drawText(textRenderer, textRenderer.trimToWidth(shareMsg, CENTER_W), cx, top + 217, C_GOLD, false);
         }
     }
 

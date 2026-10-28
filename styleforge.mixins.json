@@ -1,0 +1,13 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "dev.styleforge.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "ParticleManagerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  },
+  "refmap": "styleforge-refmap.json"
+}
