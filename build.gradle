@@ -18,7 +18,7 @@ sourceSets {
         }
         resources {
             srcDirs = ['.']
-            include 'fabric.mod.json', 'styleforge.mixins.json'
+            include 'fabric.mod.json'
         }
     }
 }

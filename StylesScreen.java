@@ -20,6 +20,8 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.Set;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -89,13 +91,15 @@ public class StylesScreen extends Screen {
     private String shareMsg = "";
 
     private final List<Entry> entries = new ArrayList<>();
+    private final Set<Category> expanded = EnumSet.noneOf(Category.class); // aufgeklappte Gruppen (Pfeil)
     private final Map<String, PixelImage> synthCache = new HashMap<>();
 
     public StylesScreen(Screen parent) {
         super(Text.literal("StyleForge"));
         this.parent = parent;
-        buildEntries();
+        rebuildEntries();
         CustomStyles.scan(); // neue PNGs im custom-Ordner sofort uebernehmen
+        PackSync.globalChanged(); // erzeugt z.B. die Block-Partikel-Dateien, falls sie fehlen
     }
 
     private static ItemStack stack(String id) {
@@ -103,18 +107,37 @@ public class StylesScreen extends Screen {
         return new ItemStack(item);
     }
 
-    private void buildEntries() {
+    private void rebuildEntries() {
+        entries.clear();
         for (Category c : Category.values()) {
+            List<String> slots = PackSync.slotIds(c);
             entries.add(new Entry(c, null, c.displayName, new ItemStack(iconItem(c)), false));
-            for (String slot : PackSync.slotIds(c)) {
-                String itemId = switch (c) {
-                    case TOOLS -> slot + "_sword";
-                    case CRYSTAL -> "end_crystal";
-                    default -> slot;
-                };
-                entries.add(new Entry(c, slot, PackSync.slotLabel(c, slot), stack(itemId), true));
+            if (!slots.isEmpty() && expanded.contains(c)) {
+                for (String slot : slots) {
+                    String itemId = switch (c) {
+                        case TOOLS -> slot + "_sword";
+                        case CRYSTAL -> "end_crystal";
+                        default -> slot;
+                    };
+                    entries.add(new Entry(c, slot, PackSync.slotLabel(c, slot), stack(itemId), true));
+                }
             }
         }
+    }
+
+    private boolean isGroup(Entry e) {
+        return !e.sub() && !PackSync.slotIds(e.cat()).isEmpty();
+    }
+
+    private void toggleGroup(Category c) {
+        if (!expanded.remove(c)) {
+            expanded.add(c);
+        } else if (category == c && slotSel != null) {
+            slotSel = null; // zugeklappt: zurueck zur ganzen Kategorie
+            selected = null;
+            notice = "";
+        }
+        clearAndInit();
     }
 
     private static Item iconItem(Category c) {
@@ -195,6 +218,7 @@ public class StylesScreen extends Screen {
     protected void init() {
         left = (width - W) / 2;
         top = (height - H) / 2;
+        rebuildEntries();
         tileButtons.clear();
         styled.clear();
 
@@ -243,6 +267,13 @@ public class StylesScreen extends Screen {
         // Listen-Zeilen: unsichtbar bedienbar, das Aussehen zeichnet drawSidebar()
         for (int r = 0; r < VISIBLE_ROWS && catScroll + r < entries.size(); r++) {
             Entry e = entries.get(catScroll + r);
+            int ry = top + SIDE_TOP + r * ROW_H;
+            boolean group = isGroup(e);
+            if (group) {
+                // Pfeil-Button zuerst hinzufuegen, damit er den Klick im Pfeilbereich bekommt
+                addDrawableChild(ButtonWidget.builder(Text.literal("Open " + e.label()), b -> toggleGroup(e.cat()))
+                        .dimensions(left + SIDE_W - 18, ry, 16, ROW_H - 1).build());
+            }
             addDrawableChild(ButtonWidget.builder(Text.literal(e.label()), b -> {
                 category = e.cat();
                 slotSel = e.slot();
@@ -250,7 +281,7 @@ public class StylesScreen extends Screen {
                 selected = null;
                 page = 0;
                 clearAndInit();
-            }).dimensions(left, top + SIDE_TOP + r * ROW_H, SIDE_W, ROW_H - 1).build());
+            }).dimensions(left, ry, group ? SIDE_W - 18 : SIDE_W, ROW_H - 1).build());
         }
 
         int cx = left + SIDE_W + GAP;
@@ -379,7 +410,14 @@ public class StylesScreen extends Screen {
             StyleManager.Extra e = StyleManager.EXTRAS.get(i);
             btn(cx, top + 62 + i * 20, CENTER_W, 16,
                     e.label() + ": " + (StyleManager.getExtra(e) ? "ON" : "OFF"),
-                    () -> { StyleManager.toggleExtra(e); clearAndInit(); });
+                    () -> {
+                        StyleManager.toggleExtra(e);
+                        if (e.id().equals("block_particles")) {
+                            PackSync.globalChanged();
+                            notice = "Applies when you close the menu.";
+                        }
+                        clearAndInit();
+                    });
         }
         btn(cx, top + 197, 106, 16, "Export ZIP", this::doExport);
         btn(cx + 114, top + 197, 106, 16, "Import ZIP", this::doImport);
@@ -539,9 +577,19 @@ public class StylesScreen extends Screen {
             ctx.drawText(textRenderer, textRenderer.trimToWidth(e.label(), maxW), textX, y + 5,
                     sel ? C_TEXT : C_MUTED, false);
             if (!e.sub()) {
+                boolean group = isGroup(e);
                 String n = String.valueOf(StyleRegistry.all(e.cat()).size());
-                ctx.drawText(textRenderer, n, left + SIDE_W - 9 - textRenderer.getWidth(n), y + 5,
+                int right = left + SIDE_W - (group ? 20 : 9);
+                ctx.drawText(textRenderer, n, right - textRenderer.getWidth(n), y + 5,
                         sel ? C_ACCENT : C_DISABLED, false);
+                if (group) {
+                    boolean open = expanded.contains(e.cat());
+                    boolean overArrow = inside(mx, my, left + SIDE_W - 18, y, 16, ROW_H - 1);
+                    ctx.fill(left + SIDE_W - 18, y + 1, left + SIDE_W - 3, y + ROW_H - 2, overArrow ? C_CARD_HOVER : C_CARD);
+                    String arrow = open ? "v" : ">";
+                    ctx.drawText(textRenderer, arrow, left + SIDE_W - 10 - textRenderer.getWidth(arrow) / 2, y + 5,
+                            open ? C_ACCENT : C_MUTED, false);
+                }
             }
         }
         int total = entries.size();

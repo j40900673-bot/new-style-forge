@@ -13,6 +13,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import net.minecraft.resource.Resource;
+import net.minecraft.resource.ResourceManager;
+import net.minecraft.util.Identifier;
+import java.io.Reader;
+import java.util.Comparator;
+import java.util.Map;
+import java.util.stream.Stream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
@@ -266,6 +276,7 @@ public final class PackSync {
             changed |= syncScale(pack, c);
             changed |= syncParticles(pack);
             changed |= syncSounds(pack);
+            changed |= syncBlockParticles(pack);
         } catch (IOException | RuntimeException e) {
             LOG.warn("Ressourcenpaket konnte nicht aktualisiert werden: {}", e.toString());
             lastMessage = "Could not update pack, see log.";
@@ -382,6 +393,63 @@ public final class PackSync {
         }
         return writeIfDifferent(f, "{\"entity.generic.explode\":{\"replace\":true,"
                 + "\"subtitle\":\"subtitles.entity.generic.explode\",\"sounds\":" + sounds + "}}");
+    }
+
+    /**
+     * Block-Partikel (beim Abbauen und Zerstoeren) aus: Wie im bekannten Textpaket bekommt jedes Block-Modell
+     * mit "particle"-Textur stattdessen die durchsichtige Textur block/blank. Die Modelle werden aus den
+     * Spieldateien des Spielers selbst erzeugt (nichts Fremdes wird mitgeliefert). Bei "an" wird alles geloescht.
+     */
+    private static boolean syncBlockParticles(Path pack) throws IOException {
+        Path dir = pack.resolve(ASSETS + "models/block");
+        Path blank = pack.resolve(TEX + "block/blank.png");
+        boolean off = !StyleManager.isBlockParticles();
+        if (!off) {
+            boolean changed = false;
+            if (Files.isDirectory(dir)) {
+                List<Path> all;
+                try (Stream<Path> st = Files.walk(dir)) {
+                    all = st.sorted(Comparator.reverseOrder()).toList();
+                }
+                for (Path p : all) {
+                    changed |= Files.deleteIfExists(p);
+                }
+            }
+            changed |= Files.deleteIfExists(blank);
+            return changed;
+        }
+        if (Files.isDirectory(dir) && Files.exists(blank)) {
+            return false; // schon erzeugt
+        }
+        ResourceManager rm = MinecraftClient.getInstance().getResourceManager();
+        if (rm == null) return false;
+        Map<Identifier, Resource> found = rm.findResources("models/block", id -> id.getPath().endsWith(".json"));
+        Gson gson = new Gson();
+        int count = 0;
+        for (Map.Entry<Identifier, Resource> e : found.entrySet()) {
+            Identifier id = e.getKey();
+            if (!"minecraft".equals(id.getNamespace())) continue;
+            String rel = id.getPath().substring("models/block/".length());
+            JsonObject obj;
+            try (Reader r = e.getValue().getReader()) {
+                obj = JsonParser.parseReader(r).getAsJsonObject();
+            } catch (IOException | RuntimeException ex) {
+                continue;
+            }
+            if (!obj.has("textures") || !obj.get("textures").isJsonObject()) continue;
+            JsonObject tex = obj.getAsJsonObject("textures");
+            if (!tex.has("particle")) continue;
+            tex.addProperty("particle", "minecraft:block/blank");
+            Path out = dir.resolve(rel);
+            Files.createDirectories(out.getParent());
+            Files.writeString(out, gson.toJson(obj), StandardCharsets.UTF_8);
+            count++;
+        }
+        if (count == 0) return false;
+        Files.createDirectories(blank.getParent());
+        ImageIO.write(new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB), "png", blank.toFile());
+        LOG.info("StyleForge: {} Block-Modelle ohne Partikel erzeugt", count);
+        return true;
     }
 
     // ---- Item-Modelle ---------------------------------------------------------------------
