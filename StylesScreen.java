@@ -15,19 +15,21 @@ import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
 
 import java.util.ArrayList;
-import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Styles-Menue im dunklen Violett-Design. Die Eingabe laeuft ueber normale Widgets (ButtonWidget,
  * TextFieldWidget); das Aussehen wird per DrawContext ueber die Widgets gezeichnet. Die 3D-Vorschau
- * besteht nur aus gefuellten Rechtecken (siehe Preview3D).
+ * kommt aus Preview3D (Raytracer, als Textur gezeichnet).
  */
 public class StylesScreen extends Screen {
     private enum Tab { COLLECTIONS, EXTRAS }
@@ -36,6 +38,9 @@ public class StylesScreen extends Screen {
 
     /** Ein Button, dessen Aussehen selbst gezeichnet wird. flat = nur Text (Tabs), highlight = aktiver Tab. */
     private record Styled(ButtonWidget btn, int x, int y, int w, int h, String label, boolean flat, boolean highlight) {}
+
+    /** Eintrag der linken Liste: eine Kategorie oder ein Unterbereich davon (z.B. Schwertsorte, Kristall in der Hand). */
+    private record Entry(Category cat, String slot, String label, ItemStack icon, boolean sub) {}
 
     // Farbsystem
     private static final int C_DIM = 0xE0050409;
@@ -56,15 +61,16 @@ public class StylesScreen extends Screen {
     private static final int C_GOLD = 0xFFF5C542;
 
     // Layout (in GUI-Pixeln)
-    private static final int W = 440, H = 252;
-    private static final int SIDE_W = 96, GAP = 6, CENTER_W = 220, INSP_W = 110;
+    private static final int W = 460, H = 252;
+    private static final int SIDE_W = 96, GAP = 6, CENTER_W = 220, INSP_W = 130;
     private static final int COLS = 4, ROWS = 3, PER_PAGE = COLS * ROWS;
     private static final int CELL_W = 52, CELL_H = 42, STRIDE_X = 55, STRIDE_Y = 44;
-    private static final int VISIBLE_CATS = 12, ROW_H = 17, SIDE_TOP = 25;
+    private static final int VISIBLE_ROWS = 12, ROW_H = 17, SIDE_TOP = 25;
 
     private final Screen parent;
     private Tab tab = Tab.COLLECTIONS;
     private Category category = Category.CRYSTAL;
+    private String slotSel = null; // null = ganze Kategorie
     private Style selected;
     private String query = "";
     private boolean favoritesOnly;
@@ -81,18 +87,34 @@ public class StylesScreen extends Screen {
     private String status = "";
     private String notice = "";
     private String shareMsg = "";
-    private int toolTarget = 0; // 0 = alle, sonst Index in PackSync.slotIds(category) + 1
 
-    private final Map<Category, ItemStack> icons = new EnumMap<>(Category.class);
+    private final List<Entry> entries = new ArrayList<>();
     private final Map<String, PixelImage> synthCache = new HashMap<>();
 
     public StylesScreen(Screen parent) {
         super(Text.literal("StyleForge"));
         this.parent = parent;
-        for (Category c : Category.values()) {
-            icons.put(c, new ItemStack(iconItem(c)));
-        }
+        buildEntries();
         CustomStyles.scan(); // neue PNGs im custom-Ordner sofort uebernehmen
+    }
+
+    private static ItemStack stack(String id) {
+        Item item = Registries.ITEM.get(Identifier.of("minecraft", id));
+        return new ItemStack(item);
+    }
+
+    private void buildEntries() {
+        for (Category c : Category.values()) {
+            entries.add(new Entry(c, null, c.displayName, new ItemStack(iconItem(c)), false));
+            for (String slot : PackSync.slotIds(c)) {
+                String itemId = switch (c) {
+                    case TOOLS -> slot + "_sword";
+                    case CRYSTAL -> "end_crystal";
+                    default -> slot;
+                };
+                entries.add(new Entry(c, slot, PackSync.slotLabel(c, slot), stack(itemId), true));
+            }
+        }
     }
 
     private static Item iconItem(Category c) {
@@ -120,6 +142,28 @@ public class StylesScreen extends Screen {
             case SHIELD -> View.SHEET;
             default -> View.NONE;
         };
+    }
+
+    private int currentEntryIndex() {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            if (e.cat() == category && Objects.equals(e.slot(), slotSel)) return i;
+        }
+        return 0;
+    }
+
+    private ItemStack currentIcon() {
+        return entries.get(currentEntryIndex()).icon();
+    }
+
+    /** Groesse in der Hand gibt es beim Item, nicht beim platzierten Kristall. */
+    private boolean showScale() {
+        return PackSync.hasHeldItem(category) && !(category == Category.CRYSTAL && slotSel == null);
+    }
+
+    /** Explosions-Partikel gehoeren zum platzierten Kristall, nicht zum Item in der Hand. */
+    private boolean showParticles() {
+        return PackSync.hasParticles(category) && !(category == Category.CRYSTAL && slotSel != null);
     }
 
     @Override
@@ -155,7 +199,7 @@ public class StylesScreen extends Screen {
         styled.clear();
 
         if (selected == null || selected.category() != category) {
-            selected = StyleManager.getActive(category);
+            selected = StyleManager.getEffective(category, slotSel);
         }
 
         // Tabs
@@ -191,18 +235,17 @@ public class StylesScreen extends Screen {
     }
 
     private void initCollections() {
-        Category[] cats = Category.values();
-        int idx = category.ordinal();
+        int idx = currentEntryIndex();
         if (idx < catScroll) catScroll = idx;
-        if (idx >= catScroll + VISIBLE_CATS) catScroll = idx - VISIBLE_CATS + 1;
-        catScroll = Math.max(0, Math.min(catScroll, Math.max(0, cats.length - VISIBLE_CATS)));
+        if (idx >= catScroll + VISIBLE_ROWS) catScroll = idx - VISIBLE_ROWS + 1;
+        catScroll = Math.max(0, Math.min(catScroll, Math.max(0, entries.size() - VISIBLE_ROWS)));
 
-        // Kategorie-Zeilen: unsichtbar bedienbar, das Aussehen zeichnet drawSidebar()
-        for (int r = 0; r < VISIBLE_CATS && catScroll + r < cats.length; r++) {
-            Category c = cats[catScroll + r];
-            addDrawableChild(ButtonWidget.builder(Text.literal(c.displayName), b -> {
-                category = c;
-                toolTarget = 0;
+        // Listen-Zeilen: unsichtbar bedienbar, das Aussehen zeichnet drawSidebar()
+        for (int r = 0; r < VISIBLE_ROWS && catScroll + r < entries.size(); r++) {
+            Entry e = entries.get(catScroll + r);
+            addDrawableChild(ButtonWidget.builder(Text.literal(e.label()), b -> {
+                category = e.cat();
+                slotSel = e.slot();
                 notice = "";
                 selected = null;
                 page = 0;
@@ -226,11 +269,11 @@ public class StylesScreen extends Screen {
                 () -> { favoritesOnly = !favoritesOnly; page = 0; clearAndInit(); });
 
         int cy = top + 50;
-        if (PackSync.hasHeldItem(category)) {
+        if (showScale()) {
             btn(cx + 34, cy, 16, 16, "-", () -> changeScale(-0.1));
             btn(cx + 90, cy, 16, 16, "+", () -> changeScale(0.1));
         }
-        if (PackSync.hasParticles(category)) {
+        if (showParticles()) {
             btn(cx + 112, cy, 108, 16, "Particles: " + (StyleManager.isParticles(category) ? "ON" : "OFF"), () -> {
                 StyleManager.toggleParticles(category);
                 PackSync.settingChanged(category);
@@ -298,19 +341,9 @@ public class StylesScreen extends Screen {
         if (s == null) return;
 
         boolean active = isActiveFor(s);
-        String slot = slotId();
+        String slot = slotSel;
 
-        List<String> slotIds = PackSync.slotIds(s.category());
-        if (!slotIds.isEmpty()) {
-            String name = PackSync.slotLabel(s.category(), slot);
-            btn(ix + 4, top + 134, INSP_W - 8, 14, "For: " + name, () -> {
-                toolTarget = (toolTarget + 1) % (slotIds.size() + 1);
-                notice = "";
-                clearAndInit();
-            });
-        }
-
-        ButtonWidget fav = btn(ix + 4, top + 150, INSP_W - 8, 18,
+        ButtonWidget fav = btn(ix + 4, top + 166, INSP_W - 8, 16,
                 StyleManager.isFavorite(s) ? "Unfavorite" : "Favorite",
                 () -> { StyleManager.toggleFavorite(s); clearAndInit(); });
         fav.active = !s.vanilla();
@@ -318,7 +351,7 @@ public class StylesScreen extends Screen {
         String label;
         if (active) label = s.vanilla() ? "Default active" : "Deactivate";
         else label = s.vanilla() ? "Use default" : "Activate";
-        ButtonWidget act = btn(ix + 4, top + 172, INSP_W - 8, 18, label, () -> {
+        ButtonWidget act = btn(ix + 4, top + 184, INSP_W - 8, 16, label, () -> {
             if (slot != null) {
                 StyleManager.activateSlot(active ? StyleRegistry.vanilla(s.category()) : s, slot);
             } else if (active) {
@@ -330,7 +363,7 @@ public class StylesScreen extends Screen {
             if (!m.isEmpty()) notice = m;
             else if (!active && s.custom()) {
                 notice = PackSync.supports(s.category())
-                        ? "Applying... pack " + PackSync.PACK_NAME + " is enabled automatically."
+                        ? "Applying... the pack is enabled automatically."
                         : "Preview only - not applied in game yet.";
             } else notice = "";
             clearAndInit();
@@ -378,14 +411,8 @@ public class StylesScreen extends Screen {
         notice = "Applies when you close the menu.";
     }
 
-    /** Unterbereich, der gerade bearbeitet wird (Tools: Schwertsorte, Golden Apples: Apfelsorte), sonst null. */
-    private String slotId() {
-        List<String> ids = PackSync.slotIds(category);
-        return ids.isEmpty() || toolTarget <= 0 || toolTarget > ids.size() ? null : ids.get(toolTarget - 1);
-    }
-
     private boolean isActiveFor(Style s) {
-        String slot = s.category() == category ? slotId() : null;
+        String slot = s.category() == category ? slotSel : null;
         return slot == null
                 ? StyleManager.isActive(s)
                 : StyleManager.getEffective(s.category(), slot).equals(s);
@@ -394,7 +421,7 @@ public class StylesScreen extends Screen {
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
         if (tab == Tab.COLLECTIONS && mouseX >= left && mouseX < left + SIDE_W) {
-            int max = Math.max(0, Category.values().length - VISIBLE_CATS);
+            int max = Math.max(0, entries.size() - VISIBLE_ROWS);
             int next = Math.max(0, Math.min(max, catScroll + (verticalAmount < 0 ? 1 : -1)));
             if (next != catScroll) {
                 catScroll = next;
@@ -492,29 +519,36 @@ public class StylesScreen extends Screen {
     }
 
     private void drawSidebar(DrawContext ctx, int mx, int my) {
-        Category[] cats = Category.values();
-        for (int r = 0; r < VISIBLE_CATS && catScroll + r < cats.length; r++) {
-            Category c = cats[catScroll + r];
+        for (int r = 0; r < VISIBLE_ROWS && catScroll + r < entries.size(); r++) {
+            Entry e = entries.get(catScroll + r);
             int y = top + SIDE_TOP + r * ROW_H;
-            boolean sel = c == category;
+            boolean sel = e.cat() == category && Objects.equals(e.slot(), slotSel);
             boolean hover = inside(mx, my, left, y, SIDE_W, ROW_H - 1);
             ctx.fill(left, y, left + SIDE_W, y + ROW_H - 1, sel ? C_ROW_SEL : hover ? C_ROW_HOVER : C_SIDE);
             if (sel) ctx.fill(left, y, left + 2, y + ROW_H - 1, C_ACCENT);
-            ctx.drawItem(icons.get(c), left + 4, y + 1);
-            if (StyleManager.hasAnyActive(c)) {
-                ctx.fill(left + 3, y + 1, left + 7, y + 5, C_GREEN);
+            int indent = e.sub() ? 8 : 0;
+            ctx.drawItem(e.icon(), left + 4 + indent, y + 1);
+            boolean on = e.slot() == null
+                    ? StyleManager.hasAnyActive(e.cat())
+                    : !StyleManager.getEffective(e.cat(), e.slot()).vanilla();
+            if (on) {
+                ctx.fill(left + 3 + indent, y + 1, left + 7 + indent, y + 5, C_GREEN);
             }
-            ctx.drawText(textRenderer, textRenderer.trimToWidth(c.displayName, SIDE_W - 44), left + 24, y + 5,
+            int textX = left + 24 + indent;
+            int maxW = e.sub() ? SIDE_W - 24 - indent - 6 : SIDE_W - 44;
+            ctx.drawText(textRenderer, textRenderer.trimToWidth(e.label(), maxW), textX, y + 5,
                     sel ? C_TEXT : C_MUTED, false);
-            String n = String.valueOf(StyleRegistry.all(c).size());
-            ctx.drawText(textRenderer, n, left + SIDE_W - 9 - textRenderer.getWidth(n), y + 5,
-                    sel ? C_ACCENT : C_DISABLED, false);
+            if (!e.sub()) {
+                String n = String.valueOf(StyleRegistry.all(e.cat()).size());
+                ctx.drawText(textRenderer, n, left + SIDE_W - 9 - textRenderer.getWidth(n), y + 5,
+                        sel ? C_ACCENT : C_DISABLED, false);
+            }
         }
-        int total = cats.length;
-        if (total > VISIBLE_CATS) {
-            int trackH = VISIBLE_CATS * ROW_H;
-            int thumbH = Math.max(8, trackH * VISIBLE_CATS / total);
-            int maxScroll = total - VISIBLE_CATS;
+        int total = entries.size();
+        if (total > VISIBLE_ROWS) {
+            int trackH = VISIBLE_ROWS * ROW_H;
+            int thumbH = Math.max(8, trackH * VISIBLE_ROWS / total);
+            int maxScroll = total - VISIBLE_ROWS;
             int thumbY = top + SIDE_TOP + (trackH - thumbH) * catScroll / maxScroll;
             ctx.fill(left + SIDE_W - 3, top + SIDE_TOP, left + SIDE_W - 1, top + SIDE_TOP + trackH, C_LINE);
             ctx.fill(left + SIDE_W - 3, thumbY, left + SIDE_W - 1, thumbY + thumbH, C_ACCENT);
@@ -522,7 +556,7 @@ public class StylesScreen extends Screen {
     }
 
     private void drawControls(DrawContext ctx) {
-        if (!PackSync.hasHeldItem(category)) return;
+        if (!showScale()) return;
         int cx = left + SIDE_W + GAP;
         int cy = top + 50;
         ctx.drawText(textRenderer, "Scale", cx, cy + 4, C_MUTED, false);
@@ -544,7 +578,7 @@ public class StylesScreen extends Screen {
             ctx.fill(x + 1, y + 1, x + CELL_W - 1, y + CELL_H - 1, hover ? C_CARD_HOVER : C_CARD);
 
             if (s.vanilla()) {
-                ctx.drawItem(icons.get(s.category()), x + (CELL_W - 16) / 2, y + 5);
+                ctx.drawItem(currentIcon(), x + (CELL_W - 16) / 2, y + 5);
             } else {
                 drawPreview(ctx, s, x + 3, y + 3, x + CELL_W - 3, y + 25);
             }
@@ -575,41 +609,42 @@ public class StylesScreen extends Screen {
         Style s = selected;
         if (s == null) return;
 
-        drawInspectorPreview(ctx, s, ix + 4, top + 30, ix + INSP_W - 4, top + 94);
-        ctx.drawText(textRenderer, textRenderer.trimToWidth(s.name(), INSP_W - 8), ix + 4, top + 100, C_TEXT, true);
-        ctx.drawText(textRenderer, s.category().displayName + (s.custom() ? " - custom" : ""), ix + 4, top + 112, C_MUTED, false);
+        drawInspectorPreview(ctx, s, ix + 4, top + 28, ix + INSP_W - 4, top + 116);
+        ctx.drawText(textRenderer, textRenderer.trimToWidth(s.name(), INSP_W - 8), ix + 4, top + 120, C_TEXT, true);
+        String sub = s.category().displayName + (slotSel != null ? " / " + PackSync.slotLabel(s.category(), slotSel) : "")
+                + (s.custom() ? " - custom" : "");
+        ctx.drawText(textRenderer, textRenderer.trimToWidth(sub, INSP_W - 8), ix + 4, top + 131, C_MUTED, false);
 
         boolean active = isActiveFor(s);
-        ctx.drawText(textRenderer, active ? "Active" : "Inactive", ix + 4, top + 124, active ? C_GREEN : C_MUTED, false);
+        ctx.drawText(textRenderer, active ? "Active" : "Inactive", ix + 4, top + 142, active ? C_GREEN : C_MUTED, false);
+        Style now = StyleManager.getEffective(s.category(), slotSel);
+        ctx.drawText(textRenderer, "Now: " + textRenderer.trimToWidth(now.name(), INSP_W - 38), ix + 4, top + 153, C_MUTED, false);
+
         if (!notice.isEmpty()) {
-            int ny = top + 194;
+            int ny = top + 204;
             for (var line : textRenderer.wrapLines(Text.literal(notice), INSP_W - 8)) {
-                if (ny > top + 218) break;
+                if (ny > top + 220) break;
                 ctx.drawText(textRenderer, line, ix + 4, ny, C_GOLD, false);
                 ny += 9;
             }
         }
-        if (PackSync.slotIds(s.category()).isEmpty()) {
-            Style now = StyleManager.getActive(s.category());
-            ctx.drawText(textRenderer, "Now: " + textRenderer.trimToWidth(now.name(), INSP_W - 38), ix + 4, top + 136, C_MUTED, false);
-        }
     }
 
-    /** Grosse Vorschau: 3D (drehendes Item, Isometrie-Block) oder Textur-Blatt, sonst Farbflaeche. */
+    /** Grosse Vorschau: 3D (drehendes Item, Block, Kristall) oder Textur-Blatt, sonst Farbflaeche. */
     private void drawInspectorPreview(DrawContext ctx, Style s, int x1, int y1, int x2, int y2) {
         ctx.fill(x1 - 1, y1 - 1, x2 + 1, y2 + 1, C_ACCENT);
         ctx.fill(x1, y1, x2, y2, C_SIDE);
 
         if (s.vanilla()) {
             int cx = (x1 + x2) / 2;
-            ctx.drawItem(icons.get(s.category()), cx - 8, y1 + 16);
+            ctx.drawItem(currentIcon(), cx - 8, y1 + 30);
             String t = "Vanilla";
-            ctx.drawText(textRenderer, t, cx - textRenderer.getWidth(t) / 2, y1 + 38, C_MUTED, false);
+            ctx.drawText(textRenderer, t, cx - textRenderer.getWidth(t) / 2, y1 + 52, C_MUTED, false);
             return;
         }
 
         View view = viewOf(s.category());
-        if (s.category() == Category.CRYSTAL && "item".equals(slotId())) {
+        if (s.category() == Category.CRYSTAL && slotSel != null) {
             view = View.ITEM; // Kristall in der Hand: 16x16-Item
         }
         PixelImage img = null;
@@ -626,7 +661,6 @@ public class StylesScreen extends Screen {
             case CRYSTAL -> Preview3D.crystal(ctx, img, x1, y1, x2 - x1, y2 - y1);
             default -> Preview3D.sheet(ctx, img, x1 + 2, y1 + 2, x2 - x1 - 4, y2 - y1 - 4);
         }
-        ctx.drawText(textRenderer, view == View.SHEET ? "sheet" : "3D", x1 + 3, y2 - 10, C_DISABLED, false);
     }
 
     private PixelImage synth(Style s, View view) {
@@ -641,7 +675,6 @@ public class StylesScreen extends Screen {
         int vol = StyleManager.getExplosionVolume();
         String v = vol <= 0 ? "off" : vol + "%";
         ctx.drawText(textRenderer, v, cx + 146 + (44 - textRenderer.getWidth(v)) / 2, top + 38, vol >= 100 ? C_MUTED : C_ACCENT, false);
-
         if (!notice.isEmpty()) {
             ctx.drawText(textRenderer, textRenderer.trimToWidth(notice, CENTER_W), cx, top + 52, C_GOLD, false);
         }

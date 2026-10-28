@@ -3,7 +3,7 @@
   "id": "styleforge",
   "version": "${version}",
   "name": "StyleForge",
-  "description": "Client-seitiges Styles-Menue (Kristalle, Anker, Tools, Himmel, Ruestung, Cosmetics, Feuer, Inventar). Rein visuell, sendet nichts an Server.",
+  "description": "Client-seitiges Styles-Menue (Kristalle, Obsidian, Schwerter, Totems, Pearls, Schild, Aepfel, Cobwebs und mehr). Rein visuell, sendet nichts an Server.",
   "authors": ["StyleForge"],
   "license": "MIT",
   "environment": "client",

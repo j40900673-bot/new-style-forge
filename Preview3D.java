@@ -2,39 +2,161 @@ package dev.styleforge.ui;
 
 import dev.styleforge.style.PixelImage;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gl.RenderPipelines;
 import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.texture.NativeImage;
+import net.minecraft.client.texture.NativeImageBackedTexture;
+import net.minecraft.client.texture.TextureManager;
+import net.minecraft.util.Identifier;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Supplier;
 
 /**
- * 3D-Vorschau nur mit Rechtecken (DrawContext.fill). Fuer scharfe Bilder wird in "Zellen" gerechnet, die
- * kleiner als ein GUI-Pixel sind (die Zellgroesse ist immer eine ganze Zahl Bildschirmpixel). Die fertigen
- * Bilder werden zwischengespeichert, gleiche Rechtecke werden zu groesseren zusammengefasst.
+ * 3D-Vorschau in voller Bildschirmaufloesung: Ein kleiner Raytracer rechnet auf einem Hintergrund-Thread
+ * ein Bild (1 Pixel pro Bildschirmpixel). Das Bild wird als eigene Textur hochgeladen und mit einem einzigen
+ * Aufruf gezeichnet. Dadurch ist die Vorschau scharf und das Menue bleibt fluessig.
  */
 final class Preview3D {
+    private static final Logger LOG = LoggerFactory.getLogger("styleforge");
+
     private Preview3D() {}
 
-    // ------------------------------------------------------------------ Aufloesung
+    // ------------------------------------------------------------------ Textur-Flaeche
 
-    /** Zellen pro GUI-Pixel. Beispiel: GUI-Skalierung 4 -> 2 Zellen, jede Zelle 2x2 Bildschirmpixel. */
-    static int res() {
-        int s = (int) Math.round(MinecraftClient.getInstance().getWindow().getScaleFactor());
-        if (s <= 1) return 1;
-        if (s % 3 == 0) return 3;
-        if (s % 2 == 0) return 2;
-        return 1;
+    private record Result(byte[] png, int n, Object key) {}
+
+    private static final class Surface {
+        final Identifier id;
+        final String name;
+        volatile Result result;      // vom Hintergrund-Thread geschrieben
+        volatile boolean busy;
+        long lastStart;              // ab hier nur Render-Thread
+        Object requestedKey;
+        int requestedN;
+        Result shown;
+        NativeImageBackedTexture tex;
+        boolean broken;
+
+        Surface(String path) {
+            this.id = Identifier.of("styleforge", path);
+            this.name = "styleforge_" + path;
+        }
     }
 
-    private static void begin(DrawContext ctx, int ox, int oy, int r) {
-        var m = ctx.getMatrices();
-        m.pushMatrix();
-        m.translate((float) ox, (float) oy);
-        m.scale(1f / r, 1f / r);
+    private static final Surface CUBE = new Surface("preview_cube");
+    private static final Surface CRYSTAL = new Surface("preview_crystal");
+    private static final Surface ITEM = new Surface("preview_item");
+    private static final Surface SHEET = new Surface("preview_sheet");
+
+    private static final ExecutorService POOL = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "StyleForge-Preview");
+        t.setDaemon(true);
+        return t;
+    });
+
+    /** Bildpunkte fuer eine Flaeche von guiSize GUI-Pixeln: genau ein Bildpunkt je Bildschirmpixel (max. Faktor 4). */
+    private static int pixels(int guiSize) {
+        int sf = (int) Math.round(MinecraftClient.getInstance().getWindow().getScaleFactor());
+        return guiSize * Math.max(1, Math.min(sf, 4));
     }
 
-    private static void end(DrawContext ctx) {
-        ctx.getMatrices().popMatrix();
+    private static double secs() {
+        return (System.currentTimeMillis() % 600000L) / 1000.0;
     }
 
-    // ------------------------------------------------------------------ Farben und Bilder
+    private static void show(DrawContext ctx, Surface s, Object key, int n, long intervalMs,
+                             Supplier<int[]> job, int x, int y, int size) {
+        if (s.broken) return;
+        long now = System.currentTimeMillis();
+        boolean stale = s.requestedKey != key || s.requestedN != n || (intervalMs > 0 && now - s.lastStart >= intervalMs);
+        if (stale && !s.busy) {
+            s.busy = true;
+            s.lastStart = now;
+            s.requestedKey = key;
+            s.requestedN = n;
+            POOL.execute(() -> {
+                try {
+                    int[] fb = job.get();
+                    s.result = new Result(encode(fb, n), n, key);
+                } catch (Throwable t) {
+                    LOG.warn("3D-Vorschau fehlgeschlagen: {}", t.toString());
+                } finally {
+                    s.busy = false;
+                }
+            });
+        }
+        Result r = s.result;
+        if (r != null && r != s.shown) {
+            upload(s, r);
+        }
+        if (s.tex != null && s.shown != null && s.shown.key() == key && s.shown.n() == n) {
+            ctx.drawTexture(RenderPipelines.GUI_TEXTURED, s.id, x, y, size, size, 0f, 0f, n, n, n, n);
+        }
+    }
+
+    private static byte[] encode(int[] fb, int n) throws IOException {
+        BufferedImage bi = new BufferedImage(n, n, BufferedImage.TYPE_INT_ARGB);
+        bi.setRGB(0, 0, n, n, fb, 0, n);
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(n * n);
+        ImageIO.write(bi, "png", bos);
+        return bos.toByteArray();
+    }
+
+    private static void upload(Surface s, Result r) {
+        try {
+            NativeImage image = NativeImage.read(new ByteArrayInputStream(r.png()));
+            TextureManager tm = MinecraftClient.getInstance().getTextureManager();
+            tm.destroyTexture(s.id);
+            NativeImageBackedTexture fresh = new NativeImageBackedTexture(() -> s.name, image);
+            tm.registerTexture(s.id, fresh);
+            s.tex = fresh;
+            s.shown = r;
+        } catch (IOException | RuntimeException e) {
+            LOG.warn("3D-Vorschau konnte nicht hochgeladen werden: {}", e.toString());
+            s.broken = true;
+        }
+    }
+
+    // ------------------------------------------------------------------ Oeffentliche Ansichten
+
+    /** Block wie im Inventar (30 Grad geneigt, 225 Grad gedreht). */
+    static void cube(DrawContext ctx, PixelImage img, int ax, int ay, int aw, int ah) {
+        int size = Math.max(16, Math.min(aw, ah));
+        int n = pixels(size);
+        show(ctx, CUBE, img, n, 0, () -> renderCube(img, n), ax + (aw - size) / 2, ay + (ah - size) / 2, size);
+    }
+
+    /** Drehender End-Kristall mit Sockel. */
+    static void crystal(DrawContext ctx, PixelImage img, int ax, int ay, int aw, int ah) {
+        int size = Math.max(16, Math.min(aw, ah));
+        int n = pixels(size);
+        show(ctx, CRYSTAL, img, n, 60, () -> renderCrystal(img, n, secs()), ax + (aw - size) / 2, ay + (ah - size) / 2, size);
+    }
+
+    /** Drehendes Item mit echter Dicke (jedes Pixel ist ein Wuerfel, wie bei Minecraft-Items). */
+    static void item(DrawContext ctx, PixelImage img, int ax, int ay, int aw, int ah) {
+        int size = Math.max(16, Math.min(aw, ah));
+        int n = pixels(size);
+        show(ctx, ITEM, img, n, 60, () -> renderItem(img, n, secs()), ax + (aw - size) / 2, ay + (ah - size) / 2, size);
+    }
+
+    /** Textur-Blatt (z.B. Schild), so gross wie moeglich. */
+    static void sheet(DrawContext ctx, PixelImage img, int ax, int ay, int aw, int ah) {
+        int size = Math.max(16, Math.min(aw, ah));
+        int n = pixels(size);
+        show(ctx, SHEET, img, n, 0, () -> renderSheet(img, n), ax + (aw - size) / 2, ay + (ah - size) / 2, size);
+    }
+
+    // ------------------------------------------------------------------ Mathe
 
     static int shade(int argb, double f) {
         int r = (int) Math.min(255, ((argb >> 16) & 0xFF) * f);
@@ -47,139 +169,9 @@ final class Preview3D {
         return img.argb()[y * img.w() + x];
     }
 
-    /** Zeichnet das Bild auf die Flaeche (x, y, w, h); gleiche Pixel einer Zeile werden zusammengefasst. */
-    private static void image(DrawContext ctx, PixelImage img, int x, int y, int w, int h, double shade, boolean flip) {
-        int iw = img.w();
-        int ih = img.h();
-        for (int r = 0; r < ih; r++) {
-            int y1 = y + r * h / ih;
-            int y2 = y + (r + 1) * h / ih;
-            if (y2 <= y1) continue;
-            int c = 0;
-            while (c < iw) {
-                int col = px(img, flip ? iw - 1 - c : c, r);
-                int run = c + 1;
-                while (run < iw && px(img, flip ? iw - 1 - run : run, r) == col) run++;
-                if ((col >>> 24) >= 128) {
-                    int x1 = x + c * w / iw;
-                    int x2 = x + run * w / iw;
-                    if (x2 > x1) {
-                        ctx.fill(x1, y1, x2, y2, shade == 1.0 ? (col | 0xFF000000) : shade(col, shade));
-                    }
-                }
-                c = run;
-            }
-        }
+    private static int clamp(int v, int lo, int hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
-
-    /** Fertiges Pixelraster (n x n Zellen) zeichnen; gleiche Rechtecke ueber mehrere Zeilen werden verbunden. */
-    private static void drawGrid(DrawContext ctx, int[] fb, int n, int ox, int oy, int r) {
-        begin(ctx, ox, oy, r);
-        int[] pX0 = new int[n], pX1 = new int[n], pC = new int[n], pY = new int[n];
-        int[] cX0 = new int[n], cX1 = new int[n], cC = new int[n], cY = new int[n];
-        boolean[] pMatched = new boolean[n];
-        int pn = 0;
-        for (int y = 0; y <= n; y++) {
-            int cn = 0;
-            if (y < n) {
-                int x = 0;
-                while (x < n) {
-                    int col = fb[y * n + x];
-                    int run = x + 1;
-                    while (run < n && fb[y * n + run] == col) run++;
-                    if (col != 0) {
-                        cX0[cn] = x;
-                        cX1[cn] = run;
-                        cC[cn] = col;
-                        cY[cn] = y;
-                        cn++;
-                    }
-                    x = run;
-                }
-            }
-            for (int k = 0; k < pn; k++) pMatched[k] = false;
-            int j = 0;
-            for (int i = 0; i < cn; i++) {
-                while (j < pn && pX0[j] < cX0[i]) j++;
-                if (j < pn && pX0[j] == cX0[i] && pX1[j] == cX1[i] && pC[j] == cC[i]) {
-                    cY[i] = pY[j];
-                    pMatched[j] = true;
-                }
-            }
-            for (int k = 0; k < pn; k++) {
-                if (!pMatched[k]) ctx.fill(pX0[k], pY[k], pX1[k], y, pC[k]);
-            }
-            int[] t;
-            t = pX0; pX0 = cX0; cX0 = t;
-            t = pX1; pX1 = cX1; cX1 = t;
-            t = pC; pC = cC; cC = t;
-            t = pY; pY = cY; cY = t;
-            pn = cn;
-        }
-        end(ctx);
-    }
-
-    /** Merkt sich das zuletzt berechnete Bild, solange Textur, Groesse und Zeitschritt gleich bleiben. */
-    private static final class Cache {
-        PixelImage img;
-        int n, r, bucket = -1;
-        int[] fb;
-
-        int[] get(PixelImage i, int n2, int r2, int b) {
-            return (fb != null && img == i && n == n2 && r == r2 && bucket == b) ? fb : null;
-        }
-
-        void put(PixelImage i, int n2, int r2, int b, int[] data) {
-            img = i;
-            n = n2;
-            r = r2;
-            bucket = b;
-            fb = data;
-        }
-    }
-
-    private static final Cache CUBE_CACHE = new Cache();
-    private static final Cache CRYSTAL_CACHE = new Cache();
-
-    // ------------------------------------------------------------------ Textur-Blatt und Item
-
-    /** Textur-Blatt (z.B. Schild), so gross wie moeglich. */
-    static void sheet(DrawContext ctx, PixelImage img, int ax, int ay, int aw, int ah) {
-        int r = res();
-        begin(ctx, ax, ay, r);
-        int cw = aw * r, ch = ah * r;
-        double s = Math.min(cw / (double) img.w(), ch / (double) img.h());
-        int dw = Math.max(1, (int) (img.w() * s));
-        int dh = Math.max(1, (int) (img.h() * s));
-        image(ctx, img, (cw - dw) / 2, (ch - dh) / 2, dw, dh, 1.0, false);
-        end(ctx);
-    }
-
-    /** Drehendes Item: Breite folgt dem Kosinus, die Dicke wird durch dunklere Ebenen dahinter gezeigt. */
-    static void item(DrawContext ctx, PixelImage img, int ax, int ay, int aw, int ah) {
-        int r = res();
-        begin(ctx, ax, ay, r);
-        int cw = aw * r, ch = ah * r;
-        double ang = (System.currentTimeMillis() % 5000L) / 5000.0 * Math.PI * 2;
-        double cos = Math.cos(ang);
-        double sin = Math.sin(ang);
-        int s = Math.max(1, Math.min(cw / img.w(), ch / img.h()));
-        int fullW = img.w() * s;
-        int fullH = img.h() * s;
-        int dw = Math.max(2, (int) Math.round(fullW * Math.max(0.12, Math.abs(cos))));
-        int cx = cw / 2;
-        int y = (ch - fullH) / 2;
-        boolean flip = cos < 0;
-        int depth = 5;
-        for (int l = depth; l >= 1; l--) {
-            int off = (int) Math.round(sin * l * 0.8 * r);
-            image(ctx, img, cx - dw / 2 + off, y, dw, fullH, 0.45 + 0.02 * (depth - l), flip);
-        }
-        image(ctx, img, cx - dw / 2, y, dw, fullH, 1.0, flip);
-        end(ctx);
-    }
-
-    // ------------------------------------------------------------------ Mathe (ohne Objekte pro Pixel)
 
     private static double[] rotY(double a) {
         double c = Math.cos(a), s = Math.sin(a);
@@ -215,28 +207,31 @@ final class Preview3D {
         out[2] = (m[2] * x + m[5] * y + m[8] * z) * k;
     }
 
-    private static final double[] SO = new double[3]; // Strahl-Ursprung (Zwischenspeicher)
-    private static final double[] SD = new double[3]; // Strahl-Richtung (Zwischenspeicher)
+    // Zwischenspeicher: werden nur vom einen Hintergrund-Thread benutzt
+    private static final double[] SO = new double[3];
+    private static final double[] SD = new double[3];
+
+    // ------------------------------------------------------------------ Textur-Blatt
+
+    private static int[] renderSheet(PixelImage img, int n) {
+        int[] fb = new int[n * n];
+        double s = Math.min((double) n / img.w(), (double) n / img.h());
+        int dw = Math.max(1, (int) (img.w() * s));
+        int dh = Math.max(1, (int) (img.h() * s));
+        int ox = (n - dw) / 2;
+        int oy = (n - dh) / 2;
+        for (int y = 0; y < dh; y++) {
+            int iy = clamp(y * img.h() / dh, 0, img.h() - 1);
+            for (int x = 0; x < dw; x++) {
+                int ix = clamp(x * img.w() / dw, 0, img.w() - 1);
+                int c = px(img, ix, iy);
+                if ((c >>> 24) >= 128) fb[(oy + y) * n + ox + x] = c | 0xFF000000;
+            }
+        }
+        return fb;
+    }
 
     // ------------------------------------------------------------------ Block (Inventar-Ansicht)
-
-    /**
-     * Block wie im Inventar: gleiche Kameradrehung wie im Spiel (30 Grad nach vorn, 225 Grad gedreht),
-     * pro Zelle per Strahl berechnet, Textur ohne Weichzeichnen. Helligkeit: oben 100 %, links 80 %, rechts 60 %.
-     */
-    static void cube(DrawContext ctx, PixelImage img, int ax, int ay, int aw, int ah) {
-        int r = res();
-        int size = Math.max(16, Math.min(aw, ah));
-        int n = size * r;
-        int ox = ax + (aw - size) / 2;
-        int oy = ay + (ah - size) / 2;
-        int[] fb = CUBE_CACHE.get(img, n, r, 0);
-        if (fb == null) {
-            fb = renderCube(img, n);
-            CUBE_CACHE.put(img, n, r, 0, fb);
-        }
-        drawGrid(ctx, fb, n, ox, oy, r);
-    }
 
     private static int[] renderCube(PixelImage img, int n) {
         double[] m = mul(axisAngle(1, 0, 0, Math.toRadians(30)), rotY(Math.toRadians(225)));
@@ -275,7 +270,7 @@ final class Preview3D {
         if (tNear > tFar) return 0;
         int c = blockFace(img, m, tNear, aNear, true);
         if (c == 0) {
-            c = blockFace(img, m, tFar, aFar, false); // Innenseite hinten, falls die Vorderseite durchsichtig ist
+            c = blockFace(img, m, tFar, aFar, false);
         }
         return c;
     }
@@ -294,8 +289,8 @@ final class Preview3D {
             u = sign > 0 ? (px + 1) / 2 : (1 - px) / 2;
             v = (1 - py) / 2;
         }
-        int ix = Math.max(0, Math.min(img.w() - 1, (int) (u * img.w())));
-        int iy = Math.max(0, Math.min(img.h() - 1, (int) (v * img.h())));
+        int ix = clamp((int) (u * img.w()), 0, img.w() - 1);
+        int iy = clamp((int) (v * img.h()), 0, img.h() - 1);
         int c = px(img, ix, iy);
         if ((c >>> 24) < 128) return 0;
 
@@ -310,9 +305,97 @@ final class Preview3D {
         return shade(c, light);
     }
 
+    // ------------------------------------------------------------------ Item (Voxel, wie in Minecraft)
+
+    private static int[] renderItem(PixelImage img, int n, double secs) {
+        int w = img.w(), h = img.h();
+        double yaw = Math.toRadians((secs * 72.0) % 360.0);
+        double[] rot = mul(axisAngle(1, 0, 0, Math.toRadians(-18)), rotY(yaw));
+        double unit = n / (Math.max(w, h) * 1.5);
+        double[] o = new double[3];
+        double[] d = {-rot[6], -rot[7], -rot[8]};
+        int[] fb = new int[n * n];
+        for (int py = 0; py < n; py++) {
+            double sy = (n / 2.0 - py - 0.5) / unit;
+            for (int pxl = 0; pxl < n; pxl++) {
+                double sx = (pxl + 0.5 - n / 2.0) / unit;
+                o[0] = rot[0] * sx + rot[3] * sy + rot[6] * 40 + w / 2.0;
+                o[1] = rot[1] * sx + rot[4] * sy + rot[7] * 40 + h / 2.0;
+                o[2] = rot[2] * sx + rot[5] * sy + rot[8] * 40 + 0.5;
+                fb[py * n + pxl] = traceVoxel(img, rot, o, d);
+            }
+        }
+        return fb;
+    }
+
+    /** Strahl durch ein Gitter aus w x h x 1 Wuerfeln; jeder nicht durchsichtige Bildpunkt ist ein Wuerfel. */
+    private static int traceVoxel(PixelImage img, double[] rot, double[] o, double[] d) {
+        int w = img.w(), h = img.h();
+        double[] max = {w, h, 1};
+        double tEnter = -1e18, tExit = 1e18;
+        int axis = 0;
+        for (int a = 0; a < 3; a++) {
+            if (Math.abs(d[a]) < 1e-12) {
+                if (o[a] < 0 || o[a] > max[a]) return 0;
+                continue;
+            }
+            double t1 = -o[a] / d[a];
+            double t2 = (max[a] - o[a]) / d[a];
+            double lo = Math.min(t1, t2), hi = Math.max(t1, t2);
+            if (lo > tEnter) { tEnter = lo; axis = a; }
+            if (hi < tExit) tExit = hi;
+        }
+        if (tEnter > tExit) return 0;
+        double t = tEnter + 1e-7;
+        int ix = clamp((int) Math.floor(o[0] + d[0] * t), 0, w - 1);
+        int iy = clamp((int) Math.floor(o[1] + d[1] * t), 0, h - 1);
+        int iz = 0;
+        int sx = d[0] > 0 ? 1 : -1, sy = d[1] > 0 ? 1 : -1, sz = d[2] > 0 ? 1 : -1;
+        double tdx = Math.abs(d[0]) < 1e-12 ? 1e18 : Math.abs(1.0 / d[0]);
+        double tdy = Math.abs(d[1]) < 1e-12 ? 1e18 : Math.abs(1.0 / d[1]);
+        double tdz = Math.abs(d[2]) < 1e-12 ? 1e18 : Math.abs(1.0 / d[2]);
+        double tmx = Math.abs(d[0]) < 1e-12 ? 1e18 : ((sx > 0 ? ix + 1 : ix) - o[0]) / d[0];
+        double tmy = Math.abs(d[1]) < 1e-12 ? 1e18 : ((sy > 0 ? iy + 1 : iy) - o[1]) / d[1];
+        double tmz = Math.abs(d[2]) < 1e-12 ? 1e18 : ((sz > 0 ? iz + 1 : iz) - o[2]) / d[2];
+        int face = axis;
+        int fsign = d[axis] > 0 ? -1 : 1;
+        for (int i = 0; i < w + h + 6; i++) {
+            int c = px(img, ix, h - 1 - iy);
+            if ((c >>> 24) >= 128) {
+                return shadeVoxel(c, rot, face, fsign);
+            }
+            if (tmx <= tmy && tmx <= tmz) {
+                ix += sx;
+                tmx += tdx;
+                face = 0;
+                fsign = -sx;
+            } else if (tmy <= tmz) {
+                iy += sy;
+                tmy += tdy;
+                face = 1;
+                fsign = -sy;
+            } else {
+                iz += sz;
+                tmz += tdz;
+                face = 2;
+                fsign = -sz;
+            }
+            if (ix < 0 || ix >= w || iy < 0 || iy >= h || iz < 0 || iz >= 1) return 0;
+        }
+        return 0;
+    }
+
+    private static int shadeVoxel(int c, double[] rot, int face, int fsign) {
+        double nx = face == 0 ? fsign : 0, ny = face == 1 ? fsign : 0, nz = face == 2 ? fsign : 0;
+        double wx = rot[0] * nx + rot[1] * ny + rot[2] * nz;
+        double wy = rot[3] * nx + rot[4] * ny + rot[5] * nz;
+        double wz = rot[6] * nx + rot[7] * ny + rot[8] * nz;
+        double light = 0.5 + 0.5 * Math.max(0, 0.3 * wx + 0.75 * wy + 0.6 * wz);
+        return shade(c, light);
+    }
+
     // ------------------------------------------------------------------ End-Kristall
 
-    /** Ein Quader im Kristall-Modell mit allem, was pro Bildpunkt gebraucht wird. */
     private static final class Obj {
         double[] rot;
         double hx, hy, hz;
@@ -341,26 +424,10 @@ final class Preview3D {
         return o;
     }
 
-    private static final double[] CP = new double[3]; // Strahl-Ursprung im Objekt
-    private static final double[] CH = new double[3]; // Trefferpunkt im Objekt
+    private static final double[] CP = new double[3];
+    private static final double[] CH = new double[3];
     private static double bestT;
     private static int bestColor;
-
-    /** Drehender End-Kristall mit Sockel, gerendert aus der 64x32-Entity-Textur. */
-    static void crystal(DrawContext ctx, PixelImage img, int ax, int ay, int aw, int ah) {
-        int r = res();
-        int size = Math.max(16, Math.min(aw, ah));
-        int n = size * r;
-        int ox = ax + (aw - size) / 2;
-        int oy = ay + (ah - size) / 2;
-        int bucket = (int) (System.currentTimeMillis() / 50L); // 20 neue Bilder pro Sekunde
-        int[] fb = CRYSTAL_CACHE.get(img, n, r, bucket);
-        if (fb == null) {
-            fb = renderCrystal(img, n, bucket * 0.05);
-            CRYSTAL_CACHE.put(img, n, r, bucket, fb);
-        }
-        drawGrid(ctx, fb, n, ox, oy, r);
-    }
 
     private static int[] renderCrystal(PixelImage img, int n, double secs) {
         double k = Math.toRadians((secs * 60.0) % 360.0);
@@ -389,8 +456,10 @@ final class Preview3D {
         int[] fb = new int[n * n];
         for (int py = 0; py < n; py++) {
             double sy = (n / 2.0 - py - 0.5) / scale;
+            if (sy < -13.5 || sy > 12.0) continue; // ausserhalb des Kristalls
             for (int pxl = 0; pxl < n; pxl++) {
                 double sx = (pxl + 0.5 - n / 2.0) / scale;
+                if (Math.abs(sx) > 7.6) continue;
                 bestT = 1e18;
                 bestColor = 0;
                 for (Obj o : objs) {
@@ -444,7 +513,7 @@ final class Preview3D {
         bestColor = shade(c, light);
     }
 
-    /** Farbe aus der 64x32-Textur nach dem Minecraft-Quader-Layout (oben, unten, links, vorn, rechts, hinten). */
+    /** Farbe aus der 64x32-Textur nach dem Minecraft-Quader-Layout. */
     private static int sampleObj(PixelImage img, Obj o, int axis, int sign) {
         double fw = 2 * o.hx, fh = 2 * o.hy, fd = 2 * o.hz;
         int ru, rv, rw, rh;
@@ -471,8 +540,8 @@ final class Preview3D {
             s = (CH[0] + o.hx) / fw;
             t = 1 - (CH[1] + o.hy) / fh;
         }
-        int tx = ru + Math.max(0, Math.min(rw - 1, (int) (s * rw)));
-        int ty = rv + Math.max(0, Math.min(rh - 1, (int) (t * rh)));
+        int tx = ru + clamp((int) (s * rw), 0, rw - 1);
+        int ty = rv + clamp((int) (t * rh), 0, rh - 1);
         int ix = Math.min(img.w() - 1, tx * img.w() / 64);
         int iy = Math.min(img.h() - 1, ty * img.h() / 32);
         return img.argb()[iy * img.w() + ix];
